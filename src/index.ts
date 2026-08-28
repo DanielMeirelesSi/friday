@@ -1,5 +1,5 @@
 import { Command } from "commander";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { basename, dirname, extname, join } from "node:path";
 import { execSync } from "node:child_process";
 import * as ts from "typescript";
@@ -20,6 +20,11 @@ program
   .version("1.0.0");
 
 const extensoesComAst = new Set([".ts", ".tsx", ".js", ".jsx"]);
+const pastasIgnoradas = new Set(["node_modules", ".git", "dist"]);
+
+function arquivoSuportado(arquivo: string) {
+  return extensoesComAst.has(extname(arquivo).toLowerCase());
+}
 
 function obterScriptKind(extensao: string) {
   switch (extensao) {
@@ -175,7 +180,7 @@ function extrairEstrutura(conteudo: string, arquivo: string) {
   }
 
   const extensao = extname(arquivo).toLowerCase();
-  if (!extensoesComAst.has(extensao)) {
+  if (!arquivoSuportado(arquivo)) {
     return [];
   }
 
@@ -196,6 +201,51 @@ function extrairEstrutura(conteudo: string, arquivo: string) {
   } catch {
     return [];
   }
+}
+
+function encontrarArquivosDeCodigo(pasta: string): string[] {
+  const encontrados: string[] = [];
+
+  const visitar = (pastaAtual: string) => {
+    const entradas = readdirSync(pastaAtual, { withFileTypes: true });
+
+    entradas.forEach((entrada) => {
+      const caminho = join(pastaAtual, entrada.name);
+
+      if (entrada.isDirectory()) {
+        if (!pastasIgnoradas.has(entrada.name)) {
+          visitar(caminho);
+        }
+
+        return;
+      }
+
+      if (entrada.isFile() && arquivoSuportado(caminho)) {
+        encontrados.push(caminho);
+      }
+    });
+  };
+
+  visitar(pasta);
+
+  return encontrados;
+}
+
+function documentarArquivo(arquivo: string) {
+  const conteudo = readFileSync(arquivo, "utf-8");
+  const estrutura = extrairEstrutura(conteudo, arquivo);
+
+  console.log(`FRIDAY: analisei ${basename(arquivo)}, encontrei ${estrutura.length} elemento(s).`);
+  console.log("FRIDAY: pedindo ao Codex para redigir a documentacao. Isso pode levar alguns segundos...");
+
+  const prompt = montarPrompt(arquivo, conteudo, estrutura);
+  const documentacao = chamarCodex(prompt);
+
+  const nomeSaida = basename(arquivo) + ".md";
+  const caminhoSaida = join(dirname(arquivo), nomeSaida);
+  writeFileSync(caminhoSaida, documentacao, "utf-8");
+
+  console.log(`FRIDAY: documentacao salva em ${caminhoSaida}`);
 }
 
 function montarPrompt(
@@ -272,27 +322,47 @@ function chamarCodex(prompt: string): string {
 program
   .command("doc")
   .description("Gera documentacao tecnica do projeto")
-  .argument("<arquivo>", "caminho do arquivo a documentar")
-  .action((arquivo: string) => {
-    if (!existsSync(arquivo)) {
-      console.log(`FRIDAY: nao encontrei o arquivo "${arquivo}". Confira o caminho.`);
+  .argument("<caminho>", "caminho do arquivo ou pasta a documentar")
+  .action((caminho: string) => {
+    if (!existsSync(caminho)) {
+      console.log(`FRIDAY: nao encontrei o caminho "${caminho}". Confira o caminho.`);
       return;
     }
 
-    const conteudo = readFileSync(arquivo, "utf-8");
-    const estrutura = extrairEstrutura(conteudo, arquivo);
+    const estatisticas = statSync(caminho);
 
-    console.log(`FRIDAY: analisei ${basename(arquivo)}, encontrei ${estrutura.length} elemento(s).`);
-    console.log("FRIDAY: pedindo ao Codex para redigir a documentacao. Isso pode levar alguns segundos...");
+    if (estatisticas.isFile()) {
+      documentarArquivo(caminho);
+      return;
+    }
 
-    const prompt = montarPrompt(arquivo, conteudo, estrutura);
-    const documentacao = chamarCodex(prompt);
+    if (!estatisticas.isDirectory()) {
+      console.log(`FRIDAY: o caminho "${caminho}" nao e um arquivo nem uma pasta.`);
+      return;
+    }
 
-    const nomeSaida = basename(arquivo) + ".md";
-    const caminhoSaida = join(dirname(arquivo), nomeSaida);
-    writeFileSync(caminhoSaida, documentacao, "utf-8");
+    const arquivos = encontrarArquivosDeCodigo(caminho);
 
-    console.log(`FRIDAY: documentacao salva em ${caminhoSaida}`);
+    if (arquivos.length === 0) {
+      console.log(`FRIDAY: nao encontrei arquivos .ts, .tsx, .js ou .jsx em "${caminho}".`);
+      return;
+    }
+
+    let documentados = 0;
+
+    arquivos.forEach((arquivo, indice) => {
+      console.log(`FRIDAY: [${indice + 1}/${arquivos.length}] documentando ${basename(arquivo)}`);
+
+      try {
+        documentarArquivo(arquivo);
+        documentados++;
+      } catch (erro) {
+        const mensagem = erro instanceof Error ? erro.message : String(erro);
+        console.log(`FRIDAY: falhei ao documentar ${arquivo}: ${mensagem}`);
+      }
+    });
+
+    console.log(`FRIDAY: documentacao concluida. ${documentados}/${arquivos.length} arquivo(s) documentado(s).`);
   });
 
 program.parse();
