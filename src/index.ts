@@ -1,8 +1,16 @@
 import { Command } from "commander";
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, dirname, extname, join } from "node:path";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import * as ts from "typescript";
+import { parse as parseYaml } from "yaml";
 
 const program = new Command();
 
@@ -12,6 +20,26 @@ type ItemEstrutura = {
   nome: string;
   parametros?: string[];
   classe?: string;
+};
+
+type ResultadoCheck = {
+  comando: string;
+  passou: boolean;
+  codigoSaida: number | null;
+  saida: string;
+};
+
+type MudancasGit = {
+  diff: string;
+  arquivos: string[];
+};
+
+type RelatorioVerify = {
+  timestamp: string;
+  branch: string;
+  arquivosAlterados: string[];
+  checks: ResultadoCheck[];
+  revisao: string;
 };
 
 program
@@ -318,6 +346,289 @@ function chamarCodex(prompt: string): string {
 
   return linhas.slice(inicio, fim).join("\n").trim();
 }
+
+function lerChecksConfigurados(raiz: string) {
+  const caminhoConfig = join(raiz, "friday.yml");
+
+  if (!existsSync(caminhoConfig)) {
+    return [];
+  }
+
+  try {
+    const configuracao = parseYaml(readFileSync(caminhoConfig, "utf-8")) as
+      | { checks?: unknown }
+      | null;
+    const checks = configuracao?.checks;
+
+    if (!Array.isArray(checks)) {
+      return [];
+    }
+
+    return checks
+      .filter((check): check is string => typeof check === "string" && check.trim().length > 0)
+      .map((check) => check.trim());
+  } catch (erro) {
+    const mensagem = erro instanceof Error ? erro.message : String(erro);
+    console.log(`FRIDAY: nao consegui ler friday.yml (${mensagem}). Vou seguir sem checks.`);
+    return [];
+  }
+}
+
+function rodarProcesso(comando: string, args: string[], cwd: string) {
+  const resultado = spawnSync(comando, args, {
+    cwd,
+    encoding: "utf-8",
+    maxBuffer: 1024 * 1024 * 10,
+    windowsHide: true,
+  });
+
+  return {
+    codigoSaida: resultado.status,
+    stdout: resultado.stdout ?? "",
+    stderr: resultado.stderr ?? "",
+    erro: resultado.error?.message,
+  };
+}
+
+function rodarCheck(comando: string, cwd: string): ResultadoCheck {
+  const resultado = spawnSync(comando, {
+    cwd,
+    encoding: "utf-8",
+    maxBuffer: 1024 * 1024 * 10,
+    shell: true,
+    windowsHide: true,
+  });
+  const stdout = resultado.stdout ?? "";
+  const stderr = resultado.stderr ?? "";
+  const erro = resultado.error?.message;
+  const saida = [stdout, stderr, erro ? `Erro ao executar: ${erro}` : ""]
+    .filter((parte) => parte.trim().length > 0)
+    .join("\n");
+
+  return {
+    comando,
+    passou: resultado.status === 0 && !resultado.error,
+    codigoSaida: resultado.status,
+    saida,
+  };
+}
+
+function dentroDeRepositorioGit(raiz: string) {
+  const resultado = rodarProcesso("git", ["rev-parse", "--is-inside-work-tree"], raiz);
+  return resultado.codigoSaida === 0 && resultado.stdout.trim() === "true";
+}
+
+function obterBranchAtual(raiz: string) {
+  const resultado = rodarProcesso("git", ["rev-parse", "--abbrev-ref", "HEAD"], raiz);
+
+  if (resultado.codigoSaida !== 0) {
+    return "(desconhecida)";
+  }
+
+  return resultado.stdout.trim() || "(desconhecida)";
+}
+
+function separarArquivosGit(saida: string) {
+  return saida.split("\0").filter((arquivo) => arquivo.length > 0);
+}
+
+function capturarMudancasGit(raiz: string): MudancasGit | undefined {
+  const head = rodarProcesso("git", ["rev-parse", "--verify", "HEAD"], raiz);
+  const base = head.codigoSaida === 0 ? "HEAD" : "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+  const diff = rodarProcesso("git", ["diff", "--no-ext-diff", "--no-color", base, "--"], raiz);
+  const arquivos = rodarProcesso("git", ["diff", "--name-only", "-z", base, "--"], raiz);
+  const arquivosNovos = rodarProcesso("git", ["ls-files", "--others", "--exclude-standard", "-z"], raiz);
+
+  if (diff.codigoSaida !== 0 || arquivos.codigoSaida !== 0 || arquivosNovos.codigoSaida !== 0) {
+    return undefined;
+  }
+
+  const arquivosRastreados = separarArquivosGit(arquivos.stdout);
+  const arquivosNaoRastreados = separarArquivosGit(arquivosNovos.stdout);
+  const diffsArquivosNovos = arquivosNaoRastreados.map((arquivo) => {
+    try {
+      const conteudo = readFileSync(join(raiz, arquivo), "utf-8");
+      const linhas =
+        conteudo.length === 0 ? [] : conteudo.replace(/\r?\n$/, "").split(/\r?\n/);
+
+      return [
+        `diff --git a/${arquivo} b/${arquivo}`,
+        "new file mode 100644",
+        "--- /dev/null",
+        `+++ b/${arquivo}`,
+        "@@ arquivo novo nao rastreado @@",
+        ...linhas.map((linha) => `+${linha}`),
+      ].join("\n");
+    } catch (erro) {
+      const mensagem = erro instanceof Error ? erro.message : String(erro);
+
+      return [
+        `diff --git a/${arquivo} b/${arquivo}`,
+        "new file mode 100644",
+        "--- /dev/null",
+        `+++ b/${arquivo}`,
+        "@@ arquivo novo nao rastreado @@",
+        `+FRIDAY: nao consegui ler o conteudo deste arquivo novo (${mensagem}).`,
+      ].join("\n");
+    }
+  });
+
+  return {
+    diff: [diff.stdout, ...diffsArquivosNovos]
+      .filter((parte) => parte.trim().length > 0)
+      .join("\n"),
+    arquivos: [...new Set([...arquivosRastreados, ...arquivosNaoRastreados])],
+  };
+}
+
+function montarPromptVerify(diff: string, checks: ResultadoCheck[]) {
+  const limitarSaida = (saida: string) =>
+    saida.length > 2000 ? saida.slice(-2000) : saida;
+  const resumoChecks =
+    checks.length === 0
+      ? "(nenhum check configurado)"
+      : checks
+          .map((check) => `- ${check.passou ? "passou" : "falhou"}: ${check.comando}`)
+          .join("\n");
+  const saidasChecksFalhos = checks
+    .filter((check) => !check.passou && check.saida.trim().length > 0)
+    .map((check) =>
+      [
+        `Check: ${check.comando}`,
+        "Saida capturada:",
+        "```",
+        limitarSaida(check.saida),
+        "```",
+      ].join("\n")
+    )
+    .join("\n\n");
+
+  return [
+    "Voce e um revisor tecnico. Revise apenas o diff abaixo.",
+    "Aponte problemas reais: bugs, regressoes, casos de borda nao tratados, logica que passa mas esta mal resolvida, riscos e testes ausentes.",
+    "Nao decida se o codigo esta aprovado. Nao diga que os testes passaram ou falharam como veredito.",
+    "Os checks automatizados ja foram executados pelo CLI; use o resumo apenas como contexto.",
+    "A revisao e uma opiniao para um desenvolvedor humano avaliar.",
+    "",
+    "Resumo dos checks:",
+    resumoChecks,
+    "",
+    "Saida dos checks que falharam:",
+    saidasChecksFalhos || "(nenhum check falhou com saida capturada)",
+    "",
+    "Diff:",
+    "```diff",
+    diff,
+    "```",
+  ].join("\n");
+}
+
+function imprimirRelatorioVerify(relatorio: RelatorioVerify) {
+  const limitarSaida = (saida: string) =>
+    saida.length > 2000 ? saida.slice(-2000) : saida;
+
+  console.log("");
+  console.log("FRIDAY VERIFY");
+  console.log(`Branch: ${relatorio.branch}`);
+  console.log(`Arquivos alterados: ${relatorio.arquivosAlterados.length}`);
+
+  if (relatorio.arquivosAlterados.length > 0) {
+    relatorio.arquivosAlterados.forEach((arquivo) => console.log(`- ${arquivo}`));
+  }
+
+  console.log("");
+  console.log("Checks:");
+
+  if (relatorio.checks.length === 0) {
+    console.log("- nenhum check configurado");
+  } else {
+    relatorio.checks.forEach((check) => {
+      const status = check.passou ? "passou" : "falhou";
+      const codigo = check.codigoSaida === null ? "sem codigo" : `codigo ${check.codigoSaida}`;
+      console.log(`- ${status}: ${check.comando} (${codigo})`);
+
+      if (!check.passou && check.saida.trim().length > 0) {
+        console.log("  Saida:");
+        console.log(limitarSaida(check.saida));
+      }
+    });
+  }
+
+  console.log("");
+  console.log("Revisao da IA:");
+  console.log(relatorio.revisao || "(sem revisao retornada)");
+}
+
+function salvarHistoricoVerify(raiz: string, relatorio: RelatorioVerify) {
+  const pastaFriday = join(raiz, ".friday");
+  const pastaHistorico = join(raiz, ".friday", "historico");
+  const nomeArquivo = `${relatorio.timestamp.replace(/\.\d{3}Z$/, "").replace(/:/g, "-")}.json`;
+  const caminhoRelatorio = join(pastaHistorico, nomeArquivo);
+  const primeiraCriacao = !existsSync(pastaFriday);
+
+  mkdirSync(pastaHistorico, { recursive: true });
+  writeFileSync(caminhoRelatorio, `${JSON.stringify(relatorio, null, 2)}\n`, "utf-8");
+
+  if (primeiraCriacao) {
+    console.log("FRIDAY: criei a pasta .friday para o historico. Adicione .friday/ ao .gitignore se quiser evitar versionar esses relatorios.");
+  }
+
+  return caminhoRelatorio;
+}
+
+program
+  .command("verify")
+  .description("Roda checks locais e pede revisao do diff ao Codex")
+  .action(() => {
+    const raiz = process.cwd();
+    const checks = lerChecksConfigurados(raiz);
+
+    if (!dentroDeRepositorioGit(raiz)) {
+      console.log("FRIDAY: este diretorio nao parece ser um repositorio git.");
+      return;
+    }
+
+    const mudancas = capturarMudancasGit(raiz);
+
+    if (!mudancas) {
+      console.log("FRIDAY: nao consegui capturar o diff das mudancas nao commitadas.");
+      return;
+    }
+
+    if (mudancas.arquivos.length === 0 || mudancas.diff.trim().length === 0) {
+      console.log("FRIDAY: nao ha mudancas nao commitadas para verificar.");
+      return;
+    }
+
+    const resultadosChecks: ResultadoCheck[] = [];
+
+    if (checks.length === 0) {
+      console.log("FRIDAY: nenhum check configurado em friday.yml.");
+    } else {
+      checks.forEach((check) => {
+        console.log(`FRIDAY: rodando check: ${check}`);
+        const resultado = rodarCheck(check, raiz);
+        resultadosChecks.push(resultado);
+        console.log(`FRIDAY: check ${resultado.passou ? "passou" : "falhou"}: ${check}`);
+      });
+    }
+
+    console.log("FRIDAY: pedindo ao Codex uma revisao tecnica do diff...");
+    const revisao = chamarCodex(montarPromptVerify(mudancas.diff, resultadosChecks));
+    const relatorio: RelatorioVerify = {
+      timestamp: new Date().toISOString(),
+      branch: obterBranchAtual(raiz),
+      arquivosAlterados: mudancas.arquivos,
+      checks: resultadosChecks,
+      revisao,
+    };
+
+    imprimirRelatorioVerify(relatorio);
+
+    const caminhoRelatorio = salvarHistoricoVerify(raiz, relatorio);
+    console.log("");
+    console.log(`FRIDAY: historico salvo em ${caminhoRelatorio}`);
+  });
 
 program
   .command("doc")
